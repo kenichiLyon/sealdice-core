@@ -1115,6 +1115,9 @@ func setupBaseTextTemplate(d *Dice) {
 			"名片_取消设置": {
 				{`已关闭对{$t玩家}的名片自动修改。`, 1},
 			},
+			"记录_导出_成功": {
+				{`日志文件《{$t文件名字}》已上传至群文件，请自行到群文件查看。`, 1},
+			},
 		},
 	}
 
@@ -1850,6 +1853,9 @@ func setupBaseTextTemplate(d *Dice) {
 			"名片_取消设置": {
 				SubType: ".sn",
 			},
+			"记录_导出_成功": {
+				SubType: ".log export",
+			},
 		},
 	}
 	d.TextMapRaw = texts
@@ -2199,7 +2205,7 @@ func (d *Dice) loads() {
 			err := json.Unmarshal(data, &groupInfo)
 			if err == nil {
 				groupInfo.GroupID = id
-				groupInfo.UpdatedAtTime = updatedAt
+				groupInfo.UpdatedAtTime = 0
 
 				// 找出其中以群号开头的，这是1.2版本的bug
 				var toDelete []string
@@ -2594,6 +2600,7 @@ func (d *Dice) Save(isAuto bool) {
 			}
 		}
 	}
+
 	// Pinenutn: Range模板 ServiceAtNew重构代码
 	d.ImSession.ServiceAtNew.Range(func(key string, groupInfo *GroupInfo) bool {
 		// Pinenutn: ServiceAtNew重构
