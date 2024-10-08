@@ -2,7 +2,6 @@ package dice
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,19 +9,23 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
-	"time"
-
-	"sealdice-core/dice/docengine"
-	log "sealdice-core/utils/kratos"
 
 	"gopkg.in/yaml.v3"
 
 	nanoid "github.com/matoous/go-nanoid/v2"
 
+	"github.com/blevesearch/bleve/v2"
+	"github.com/blevesearch/bleve/v2/search"
+	"github.com/blevesearch/bleve/v2/search/query"
+	"github.com/sahilm/fuzzy"
 	"github.com/xuri/excelize/v2"
 )
+
+// 分词器封存了，看起来不太需要
+// _ "github.com/leopku/bleve-gse-tokenizer/v2"
 
 const HelpBuiltinGroup = "builtin"
 
@@ -45,7 +48,17 @@ type HelpDoc struct {
 	Children []*HelpDoc `json:"children"`
 }
 
-type HelpTextItems []*docengine.HelpTextItem
+type HelpTextItem struct {
+	Group       string
+	From        string
+	Title       string
+	Content     string
+	PackageName string
+	KeyWords    string
+	RelatedExt  []string
+}
+
+type HelpTextItems []*HelpTextItem
 
 func (e HelpTextItems) String(i int) string {
 	return e[i].Title
@@ -57,28 +70,28 @@ func (e HelpTextItems) Len() int {
 
 type HelpManager struct {
 	CurID        uint64
-	EngineType   EngineType
+	Index        bleve.Index
+	TextMap      SyncMap[string, *HelpTextItem] // map[string]*HelpTextItem
+	Parent       *DiceManager
+	EngineType   int
+	batch        *bleve.Batch
+	batchNum     int
 	LoadingFn    string
 	HelpDocTree  []*HelpDoc
 	GroupAliases map[string]string
-	// SearchEngine
-	searchEngine docengine.SearchEngine
 
 	Config *HelpConfig
 }
-
-type EngineType int
-
-const (
-	BleveSearch EngineType = iota // 0
-	Clover                        // 1
-	MeiliSearch                   // 2
-)
 
 const HelpConfigFilename = "help_config.yaml"
 
 type HelpConfig struct {
 	Aliases map[string][]string `yaml:"aliases" json:"aliases"`
+}
+
+func (m *HelpManager) GetNextID() string {
+	m.CurID++
+	return strconv.FormatUint(m.CurID, 10)
 }
 
 type HelpDocFormat struct {
@@ -91,40 +104,70 @@ type HelpDocFormat struct {
 
 func (m *HelpManager) loadSearchEngine() {
 	if runtime.GOARCH == "arm64" {
-		// 等木落测试，测试之前先不实现这个Clover模式，如果直接就能用，那也不必再实现他了
-		m.EngineType = BleveSearch
+		m.EngineType = 1 // 默认0，bleve
 	}
-	// 删除旧版本数据，这里先不改，先集中精力测试BleveSearch
+
+	// not bleve
+	if m.EngineType != 0 {
+		return
+	}
+
+	// 删除旧版本的
 	indexDir := "./data/_index"
 	_ = os.RemoveAll(indexDir)
+
+	mapping := bleve.NewIndexMapping()
 	indexDir = "./_help_cache"
 	_ = os.RemoveAll(indexDir)
-	switch m.EngineType {
-	case Clover:
-	case BleveSearch:
-		engine, err := docengine.NewBleveSearchEngine()
-		if err != nil {
-			log.Errorf("初始化帮助文档失败，帮助文档不可用!")
-			return
-		}
-		m.searchEngine = engine
-	default:
-		// 如果BleveSearch兼容性差，到时候全部回退到Clover查询
-		panic("unhandled default case")
+
+	// if m.Parent.UseDictForTokenizer {
+	// 这些代码封存，看起来不怎么需要
+	// if err := mapping.AddCustomTokenizer("gse", map[string]interface{}{
+	// 	"type":       "gse",
+	// 	"user_dicts": "./data/dict/zh/dict.txt", // <-- MUST specified, otherwise panic would occurred.
+	// }); err != nil {
+	// 	panic(err)
+	// }
+	// if err := mapping.AddCustomAnalyzer("gse", map[string]interface{}{
+	// 	"type":      "gse",
+	// 	"tokenizer": "gse",
+	// }); err != nil {
+	// 	panic(err)
+	// }
+	// mapping.DefaultAnalyzer = "gse"
+	// }
+
+	docMapping := bleve.NewDocumentMapping()
+	docMapping.AddFieldMappingsAt("title", bleve.NewTextFieldMapping())
+	docMapping.AddFieldMappingsAt("content", bleve.NewTextFieldMapping())
+	docMapping.AddFieldMappingsAt("package", bleve.NewTextFieldMapping())
+
+	mapping.AddDocumentMapping("helpdoc", docMapping)
+	mapping.TypeField = "_type" // 此为默认值，可修改
+
+	index, err := bleve.New(indexDir, mapping)
+	if err != nil {
+		panic(err)
 	}
+
+	m.Index = index
 }
 
 func (m *HelpManager) Close() {
-	// 关闭Bucket，并删除所有数据
-	// TODO:暂时先不动删除逻辑
-	m.searchEngine.Close()
-	_ = os.RemoveAll("./_help_cache")
+	if m.EngineType == 0 {
+		if m.Index != nil {
+			_ = m.Index.Close()
+			m.Index = nil
+
+			_ = os.RemoveAll("./_help_cache")
+		}
+	}
 }
 
-func (m *HelpManager) Load(internalCmdMap CmdMapCls, extList []*ExtInfo) {
+func (m *HelpManager) Load() {
 	m.loadSearchEngine()
 
-	_ = m.AddItem(docengine.HelpTextItem{
+	_ = m.AddItem(HelpTextItem{
 		Group: HelpBuiltinGroup,
 		Title: "骰点",
 		Content: `.help 骰点：
@@ -137,7 +180,7 @@ func (m *HelpManager) Load(internalCmdMap CmdMapCls, extList []*ExtInfo) {
 		PackageName: "帮助",
 	})
 
-	_ = m.AddItem(docengine.HelpTextItem{
+	_ = m.AddItem(HelpTextItem{
 		Group: HelpBuiltinGroup,
 		Title: "扩展",
 		Content: `.help 扩展：
@@ -155,7 +198,7 @@ func (m *HelpManager) Load(internalCmdMap CmdMapCls, extList []*ExtInfo) {
 		PackageName: "帮助",
 	})
 
-	_ = m.AddItem(docengine.HelpTextItem{
+	_ = m.AddItem(HelpTextItem{
 		Group: HelpBuiltinGroup,
 		Title: "跑团",
 		Content: `.help 跑团：
@@ -177,13 +220,9 @@ func (m *HelpManager) Load(internalCmdMap CmdMapCls, extList []*ExtInfo) {
 	m.HelpDocTree = make([]*HelpDoc, 0)
 	entries, err := os.ReadDir("data/helpdoc")
 	if err != nil {
-		log.Errorf("unable to read helpdoc folder: %v", err)
+		fmt.Println("unable to read helpdoc folder: ", err.Error())
 	}
-	start := time.Now() // 获取当前时间
-	totalEntries := len(entries)
-	for i, entry := range entries {
-		progress := float64(i+1) / float64(totalEntries) * 100
-		log.Infof("[帮助文档] 处理用户定义帮助文档组[文件夹]: 当前帮助文档加载进度: %s %.2f%% (%d/%d)", entry.Name(), progress, i+1, totalEntries)
+	for _, entry := range entries {
 		if strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
@@ -207,9 +246,7 @@ func (m *HelpManager) Load(internalCmdMap CmdMapCls, extList []*ExtInfo) {
 		buildHelpDocTree(&child, func(d *HelpDoc) {
 			if !d.IsDir {
 				ok := m.loadHelpDoc(d.Group, d.Path)
-				// TODO: Batch过大好像不会释放……
-				err = m.AddItemApply(false)
-				if ok && err == nil {
+				if ok {
 					d.LoadStatus = Loaded
 				} else {
 					d.LoadStatus = LoadError
@@ -218,32 +255,7 @@ func (m *HelpManager) Load(internalCmdMap CmdMapCls, extList []*ExtInfo) {
 		})
 		m.HelpDocTree = append(m.HelpDocTree, &child)
 	}
-	err = m.AddItemApply(false)
-	if err != nil {
-		log.Errorf("加载用户自定义帮助文档出现异常!: %v", err)
-	}
-	log.Infof("[帮助文档] 用户定义的帮助文档组已加载完成!")
-	log.Infof("[帮助文档] 正在处理指令相关（含插件）帮助文档组")
-	err = m.addInternalCmdHelp(internalCmdMap)
-	if err != nil {
-		log.Errorf("加载内置指令帮助文档出现异常: %v", err)
-	}
-	err = m.AddItemApply(false)
-	if err != nil {
-		log.Errorf("加载内置指令帮助文档出现异常: %v", err)
-	}
-	err = m.addExternalCmdHelp(extList)
-	if err != nil {
-		log.Errorf("加载插件指令帮助文档出现异常: %v", err)
-	}
-	err = m.AddItemApply(true)
-	if err != nil {
-		log.Errorf("加载插件指令帮助文档出现异常: %v", err)
-	}
-	log.Infof("[帮助文档] 指令相关（含插件）帮助文档组已加载完成!")
-	m.CurID = m.searchEngine.GetTotalID()
-	elapsed := time.Since(start) // 计算执行时间
-	log.Infof("帮助文档加载完毕，共耗费时间: %s 共计加载条目:%d\n", elapsed, m.CurID)
+	_ = m.AddItemApply()
 }
 
 func (m *HelpManager) loadHelpConfig() {
@@ -299,7 +311,7 @@ func (m *HelpManager) loadHelpDoc(group string, path string) bool {
 			err = json.Unmarshal(pack, &data)
 			if err == nil {
 				for k, v := range data.Helpdoc {
-					_ = m.AddItem(docengine.HelpTextItem{
+					_ = m.AddItem(HelpTextItem{
 						Group:       group,
 						From:        path,
 						Title:       k,
@@ -315,7 +327,7 @@ func (m *HelpManager) loadHelpDoc(group string, path string) bool {
 		m.LoadingFn = path
 		f, err := excelize.OpenFile(path)
 		if err != nil {
-			log.Error("HelpManager.loadHelpDoc", err)
+			fmt.Println(err)
 			break
 		}
 
@@ -330,7 +342,7 @@ func (m *HelpManager) loadHelpDoc(group string, path string) bool {
 							// 跳过第一行
 							continue
 						} else {
-							log.Errorf("%s sheet %d(zero-based): %s\n", path, index, err)
+							fmt.Printf("%s sheet %d(zero-based): %s\n", path, index, err)
 							break
 						}
 					}
@@ -338,14 +350,14 @@ func (m *HelpManager) loadHelpDoc(group string, path string) bool {
 						continue
 					}
 					key := row[0]
-					for j := range synonymCount {
+					for j := 0; j < synonymCount; j++ {
 						if len(row[1+j]) > 0 {
 							key += "/" + row[1+j]
 						}
 					}
 					content := row[synonymCount+1]
 
-					_ = m.AddItem(docengine.HelpTextItem{
+					_ = m.AddItem(HelpTextItem{
 						Group:       group,
 						From:        path,
 						Title:       key,
@@ -358,7 +370,7 @@ func (m *HelpManager) loadHelpDoc(group string, path string) bool {
 
 		// Close the spreadsheet.
 		if err := f.Close(); err != nil {
-			log.Error("HelpManager.loadHelpDoc", err)
+			fmt.Println(err)
 		}
 		return true
 	}
@@ -368,7 +380,7 @@ func (m *HelpManager) loadHelpDoc(group string, path string) bool {
 // validateXlsxHeaders 验证 xlsx 格式 helpdoc 的表头是否是 Key Synonym（可能有多列） Content Description Catalogue Tag
 func validateXlsxHeaders(headers []string) (int, error) {
 	if len(headers) < 3 {
-		return 0, errors.New("helpdoc格式错误，缺少必须列 Key Synonym Content")
+		return 0, fmt.Errorf("helpdoc格式错误，缺少必须列 Key Synonym Content")
 	}
 
 	var (
@@ -430,83 +442,205 @@ out:
 	return synonymCount, nil
 }
 
-func (m *HelpManager) addCmdMap(packageName string, cmdMap CmdMapCls) error {
-	for k, v := range cmdMap {
-		content := v.Help
-		if content == "" {
-			content = v.ShortHelp
-		}
-		err := m.AddItem(docengine.HelpTextItem{
-			Group:       HelpBuiltinGroup,
-			Title:       k,
-			Content:     content,
-			PackageName: packageName,
-		})
-		if err != nil {
-			log.Errorf("AddCmdMapItem err:%v", err)
-			return err
+func (dm *DiceManager) AddHelpWithDice(dice *Dice) {
+	m := dm.Help
+
+	addCmdMap := func(packageName string, cmdMap CmdMapCls) {
+		for k, v := range cmdMap {
+			content := v.Help
+			if content == "" {
+				content = v.ShortHelp
+			}
+			_ = m.AddItem(HelpTextItem{
+				Group:       HelpBuiltinGroup,
+				Title:       k,
+				Content:     content,
+				PackageName: packageName,
+			})
 		}
 	}
-	return nil
-}
 
-func (m *HelpManager) addInternalCmdHelp(cmdMap CmdMapCls) error {
-	err := m.addCmdMap("核心指令", cmdMap)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (m *HelpManager) addExternalCmdHelp(ext []*ExtInfo) error {
-	for _, i := range ext {
-		err := m.AddItem(docengine.HelpTextItem{
+	addCmdMap("核心指令", dice.CmdMap)
+	for _, i := range dice.ExtList {
+		_ = m.AddItem(HelpTextItem{
 			Group:       HelpBuiltinGroup,
 			Title:       i.Name,
 			Content:     i.GetDescText(i),
 			PackageName: "扩展模块",
 		})
-		if err != nil {
-			return err
+		addCmdMap(i.Name, i.CmdMap)
+	}
+	_ = m.AddItemApply()
+}
+
+func (m *HelpManager) AddItem(item HelpTextItem) error {
+	data := map[string]string{
+		"group":   item.Group,
+		"from":    item.From,
+		"title":   item.Title,
+		"content": item.Content,
+		"package": item.PackageName,
+		"_type":   "helpdoc",
+	}
+
+	id := m.GetNextID()
+	m.TextMap.Store(id, &item)
+
+	if m.EngineType == 0 {
+		if m.batch == nil {
+			m.batch = m.Index.NewBatch()
 		}
-		err = m.addCmdMap(i.Name, i.CmdMap)
-		if err != nil {
-			return err
+		if m.batchNum >= 50 {
+			err := m.Index.Batch(m.batch)
+			if err != nil {
+				return err
+			}
+			m.batch.Reset()
+			m.batchNum = 0
 		}
+
+		m.batchNum++
+		return m.batch.Index(id, data)
 	}
 	return nil
 }
 
-func (m *HelpManager) AddItem(item docengine.HelpTextItem) error {
-	_, err := m.searchEngine.AddItem(item)
-	return err
-}
-
-func (m *HelpManager) AddItemApply(end bool) error {
-	err := m.searchEngine.AddItemApply(end)
-	if err != nil {
+func (m *HelpManager) AddItemApply() error {
+	if m.batch != nil {
+		err := m.Index.Batch(m.batch)
+		m.batch.Reset()
+		m.batch = nil
 		return err
 	}
 	return nil
 }
 
-func (m *HelpManager) Search(ctx *MsgContext, text string, titleOnly bool, pageSize, pageNum int, group string) (res *docengine.GeneralSearchResult, total, pageStart, pageEnd int, err error) {
-	return m.searchEngine.Search(ctx.Group.HelpPackages, text, titleOnly, pageSize, pageNum, group)
+func (m *HelpManager) searchBleve(ctx *MsgContext, text string, titleOnly bool, pageSize, pageNum int, group string) (*bleve.SearchResult, int, int, int, error) {
+	// 在标题中查找
+	queryTitle := query.NewMatchPhraseQuery(text)
+	queryTitle.SetField("title")
+
+	titleOrContent := bleve.NewDisjunctionQuery(queryTitle)
+
+	// 在正文中查找
+	if !titleOnly {
+		for _, i := range reSpace.Split(text, -1) {
+			queryContent := query.NewMatchPhraseQuery(i)
+			queryContent.SetField("content")
+			titleOrContent.AddQuery(queryContent)
+		}
+	}
+
+	andQuery := bleve.NewConjunctionQuery(titleOrContent)
+
+	// 限制查询组
+	for _, i := range ctx.Group.HelpPackages {
+		queryPack := query.NewMatchPhraseQuery(i)
+		queryPack.SetField("package")
+		andQuery.AddQuery(queryPack)
+	}
+
+	// 查询指定文档组
+	if group != "" {
+		queryPack := query.NewMatchPhraseQuery(group)
+		queryPack.SetField("group")
+		andQuery.AddQuery(queryPack)
+	}
+
+	req := bleve.NewSearchRequestOptions(andQuery, pageSize, (pageNum-1)*pageSize, false)
+
+	index := m.Index
+	res, err := index.Search(req)
+	if err != nil {
+		return res, 0, 0, 0, err
+	}
+
+	total := int(res.Total)
+	pageStart := (pageNum - 1) * pageSize
+	pageEnd := pageStart + len(res.Hits)
+	return res, total, pageStart, pageEnd, nil
+}
+
+func (m *HelpManager) Search(ctx *MsgContext, text string, titleOnly bool, pageSize, pageNum int, group string) (res *bleve.SearchResult, total, pageStart, pageEnd int, err error) {
+	if pageSize <= 0 || pageNum <= 0 {
+		// 为了使Search的结果完全忠实于分页参数, 而不产生有结果但与分页不相符的情况
+		return nil, 0, 0, 0, fmt.Errorf("分页参数错误")
+	}
+
+	if m.EngineType == 0 {
+		return m.searchBleve(ctx, text, titleOnly, pageSize, pageNum, group)
+	}
+
+	// 不是很好的做法，待优化
+	items := HelpTextItems{}
+	var idLst []string
+
+	m.TextMap.Range(func(id string, v *HelpTextItem) bool {
+		items = append(items, v)
+		idLst = append(idLst, id)
+		return true
+	})
+
+	hits := search.DocumentMatchCollection{}
+	matches := fuzzy.FindFrom(text, items)
+
+	total = len(matches)
+	pageStart = (pageNum - 1) * pageSize
+	pageEnd = pageNum * pageSize
+
+	if pageStart < total {
+		if pageEnd > total {
+			pageEnd = total
+		}
+
+		for _, i := range matches[pageStart:pageEnd] {
+			hits = append(hits, &search.DocumentMatch{
+				ID:    idLst[i.Index],
+				Score: float64(i.Score),
+			})
+		}
+	} else {
+		// 分页超出范围, 返回空结果
+		pageStart = -1
+		pageEnd = -1
+	}
+
+	return &bleve.SearchResult{
+		Status:  nil,
+		Request: nil,
+		Hits:    hits,
+		Total:   uint64(total),
+	}, total, pageStart, pageEnd, nil
 }
 
 func (m *HelpManager) GetSuffixText() string {
-	return m.searchEngine.GetSuffixText()
+	switch m.EngineType {
+	case 0:
+		return "(本次搜索由全文搜索完成)"
+	default:
+		return "(本次搜索由快速文档查找完成)"
+	}
 }
 
 func (m *HelpManager) GetPrefixText() string {
-	return m.searchEngine.GetPrefixText()
+	switch m.EngineType {
+	case 0:
+		return "[全文搜索]"
+	default:
+		return "[快速文档查找]"
+	}
 }
 
 func (m *HelpManager) GetShowBestOffset() int {
-	return m.searchEngine.GetShowBestOffset()
+	switch m.EngineType {
+	case 0:
+		return 1
+	default:
+		return 15
+	}
 }
 
-func (m *HelpManager) GetContent(item *docengine.HelpTextItem, depth int) string {
+func (m *HelpManager) GetContent(item *HelpTextItem, depth int) string {
 	if depth > 7 {
 		return "{递归层数过多，不予显示}"
 	}
@@ -538,15 +672,20 @@ func (m *HelpManager) GetContent(item *docengine.HelpTextItem, depth int) string
 		result.WriteString(txt[formattedIdx:left])
 		formattedIdx = right
 		name := txt[left+1 : right-1]
-		// 搜索TitleOnly，严格匹配Title的情形
-		// 如果查询到对应数据，那么就调用m.GetContent
-		valueResult, err := m.searchEngine.GetHelpTextItemByTermTitle(name)
-		if err != nil {
+		matched := false
+		// 注意: 效率更加不高
+		m.TextMap.Range(func(key string, v *HelpTextItem) bool {
+			if v.Title == name {
+				result.WriteString(m.GetContent(v, depth+1))
+				matched = true
+				return false
+			}
+			return true
+		})
+		if !matched {
 			result.WriteByte('{')
 			result.WriteString(name)
 			result.WriteString(" - 未能找到}")
-		} else {
-			result.WriteString(m.GetContent(valueResult, depth+1))
 		}
 	}
 	result.WriteString(txt[formattedIdx:])
@@ -558,56 +697,45 @@ func generateHelpDocKey() string {
 	return key
 }
 
-// 修改 buildHelpDocTree 函数签名，添加进度参数
 func buildHelpDocTree(node *HelpDoc, fn func(d *HelpDoc)) {
-	// 收集所有节点
-	allNodes := []*HelpDoc{node}
-
-	for i := 0; i < len(allNodes); i++ {
-		current := allNodes[i]
-
-		p, err := os.Stat(current.Path)
-		if err != nil {
-			continue
-		}
-
-		if !p.IsDir() {
-			continue
-		}
-
-		subs, err := os.ReadDir(current.Path)
-		if err != nil {
-			continue
-		}
-
-		current.Children = make([]*HelpDoc, 0)
-
-		for _, sub := range subs {
-			if strings.HasPrefix(sub.Name(), ".") {
-				continue
-			}
-
-			var child HelpDoc
-			child.Key = generateHelpDocKey()
-			child.Name = sub.Name()
-			child.Path = path.Join(current.Path, sub.Name())
-			child.Group = current.Group
-			child.IsDir = sub.IsDir()
-
-			if sub.IsDir() {
-				child.Type = "dir"
-				child.Children = make([]*HelpDoc, 0)
-			} else {
-				child.Type = filepath.Ext(sub.Name())
-			}
-
-			allNodes = append(allNodes, &child)
-			current.Children = append(current.Children, &child)
-		}
+	p, err := os.Stat(node.Path)
+	if err != nil {
+		return
 	}
-	for _, current := range allNodes {
-		// 调用处理函数
-		fn(current)
+
+	fn(node)
+
+	if !p.IsDir() {
+		return
+	}
+
+	subs, err := os.ReadDir(node.Path)
+	if err != nil {
+		return
+	}
+
+	for _, sub := range subs {
+		if strings.HasPrefix(sub.Name(), ".") {
+			continue
+		}
+		var child HelpDoc
+		child.Key = generateHelpDocKey()
+		child.Name = sub.Name()
+		child.Path = path.Join(node.Path, sub.Name())
+		child.Group = node.Group
+		child.IsDir = sub.IsDir()
+		if sub.IsDir() {
+			child.Type = "dir"
+			child.Children = make([]*HelpDoc, 0)
+		} else {
+			child.Type = filepath.Ext(sub.Name())
+		}
+
+		fn(&child)
+		if sub.IsDir() {
+			buildHelpDocTree(&child, fn)
+		}
+		node.Children = append(node.Children, &child)
 	}
 }
 
@@ -794,13 +922,12 @@ func (m *HelpManager) GetHelpItemPage(pageNum, pageSize int, id, group, from, ti
 		return 0, HelpTextVos{}
 	}
 
-	// 如果ID不为空
 	if id != "" {
-		// 加载对应ID的数据
-		item, err := m.searchEngine.GetItemByID(id)
-		// 若成功
-		if err == nil {
-			// 返回这条数据
+		item, ok := m.TextMap.Load(id)
+		if ok &&
+			strings.Contains(item.Group, group) &&
+			strings.Contains(item.From, from) &&
+			strings.Contains(item.Title, title) {
 			vo := HelpTextVo{
 				Group:       item.Group,
 				From:        item.From,
@@ -814,25 +941,36 @@ func (m *HelpManager) GetHelpItemPage(pageNum, pageSize int, id, group, from, ti
 		}
 		return 0, HelpTextVos{}
 	}
-	// ID为空的情形，分页查询数据
-	total, result, err := m.searchEngine.PaginateDocuments(pageSize, pageNum, group, from, title)
-	if err != nil {
-		return 0, nil
-	}
-	var items = make(HelpTextVos, 0)
-	for _, item := range result {
-		vo := HelpTextVo{
-			Group:       item.Group,
-			From:        item.From,
-			Title:       item.Title,
-			Content:     item.Content,
-			PackageName: item.PackageName,
-			KeyWords:    item.KeyWords,
+	temp := make(HelpTextVos, 0, m.TextMap.Len())
+	m.TextMap.Range(func(i string, item *HelpTextItem) bool {
+		if strings.Contains(item.Group, group) &&
+			strings.Contains(item.From, from) &&
+			strings.Contains(item.Title, title) {
+			vo := HelpTextVo{
+				Group:       item.Group,
+				From:        item.From,
+				Title:       item.Title,
+				Content:     item.Content,
+				PackageName: item.PackageName,
+				KeyWords:    item.KeyWords,
+			}
+			vo.ID, _ = strconv.Atoi(i)
+			temp = append(temp, vo)
 		}
-		vo.ID, _ = strconv.Atoi(id)
-		items = append(items, vo)
+		return true
+	})
+
+	sort.Sort(temp)
+
+	start := (pageNum - 1) * pageSize
+	end := start + pageSize
+	total := len(temp)
+	if start >= total {
+		return total, HelpTextVos{}
+	} else if end < total {
+		return total, temp[start:end]
 	}
-	return int(total), items
+	return total, temp[start:]
 }
 
 // SetDefaultHelpGroup 设置群默认搜索分组
