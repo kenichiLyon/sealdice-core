@@ -1,6 +1,7 @@
 package dice
 
 import (
+	"fmt"
 	"os"
 	"sync/atomic"
 	"time"
@@ -9,7 +10,6 @@ import (
 	"github.com/robfig/cron/v3"
 	"gopkg.in/yaml.v3"
 
-	"sealdice-core/utils/dboperator/engine"
 	log "sealdice-core/utils/kratos"
 )
 
@@ -30,7 +30,6 @@ type GroupNameCacheItem struct {
 
 type DiceManager struct { //nolint:revive
 	Dice                 []*Dice
-	Operator             engine.DatabaseOperator
 	ServeAddress         string
 	Help                 *HelpManager
 	IsHelpReloading      bool
@@ -83,8 +82,8 @@ type DiceManager struct { //nolint:revive
 	CleanupFlag   atomic.Uint32 // 1 为正在清理，0为普通状态
 }
 
-type Configs struct { //nolint:revive
-	DiceConfigs       []BaseConfig `yaml:"diceConfigs"`
+type DiceConfigs struct { //nolint:revive
+	DiceConfigs       []DiceConfig `yaml:"diceConfigs"`
 	ServeAddress      string       `yaml:"serveAddress"`
 	WebUIAddress      string       `yaml:"webUIAddress"`
 	HelpDocEngineType int          `yaml:"helpDocEngineType"`
@@ -114,12 +113,9 @@ func (dm *DiceManager) InitHelp() {
 	dm.IsHelpReloading = true
 	_ = os.MkdirAll("./data/helpdoc", 0755)
 	dm.Help = new(HelpManager)
-	dm.Help.EngineType = EngineType(dm.HelpDocEngineType)
-	if len(dm.Dice) == 0 {
-		log.Fatalf("Dice实例不存在!")
-		return
-	}
-	dm.Help.Load(dm.Dice[0].CmdMap, dm.Dice[0].ExtList)
+	dm.Help.Parent = dm
+	dm.Help.EngineType = dm.HelpDocEngineType
+	dm.Help.Load()
 	dm.IsHelpReloading = false
 }
 
@@ -154,10 +150,10 @@ func (dm *DiceManager) LoadDice() {
 		return
 	}
 
-	var dc Configs
+	var dc DiceConfigs
 	err = yaml.Unmarshal(data, &dc)
 	if err != nil {
-		log.Error("读取 data/dice.yaml 发生错误: 配置文件格式不正确", err)
+		fmt.Println("读取 data/dice.yaml 发生错误: 配置文件格式不正确")
 		panic(err)
 	}
 
@@ -200,7 +196,7 @@ func (dm *DiceManager) LoadDice() {
 }
 
 func (dm *DiceManager) Save() {
-	var dc Configs
+	var dc DiceConfigs
 	dc.ServeAddress = dm.ServeAddress
 	dc.HelpDocEngineType = dm.HelpDocEngineType
 	dc.UIPasswordSalt = dm.UIPasswordSalt
@@ -241,27 +237,31 @@ func (dm *DiceManager) InitDice() {
 
 	g, err := NewProcessExitGroup()
 	if err != nil {
-		log.Warn("进程组创建失败，若进程崩溃，gocqhttp进程可能需要手动结束。")
+		fmt.Println("进程组创建失败，若进程崩溃，gocqhttp进程可能需要手动结束。")
 	} else {
 		dm.progressExitGroupWin = g
 	}
 
 	for _, i := range dm.Dice {
 		i.Parent = dm
-		i.Init(dm.Operator)
+		i.Init()
 	}
 
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Warn("帮助文档加载失败。可能是由于退出程序过快，帮助文档还未加载完成所致", r)
+				fmt.Println("帮助文档加载失败。可能是由于退出程序过快，帮助文档还未加载完成所致", r)
 				if dm.Help != nil {
-					log.Warn("帮助文件加载失败:", dm.Help.LoadingFn)
+					fmt.Println("帮助文件加载失败:", dm.Help.LoadingFn)
 				}
 			}
 		}()
+
 		// 加载帮助
 		dm.InitHelp()
+		if len(dm.Dice) >= 1 {
+			dm.AddHelpWithDice(dm.Dice[0])
+		}
 	}()
 
 	dm.ResetAutoBackup()
@@ -278,15 +278,17 @@ func (dm *DiceManager) ResetAutoBackup() {
 		dm.backupEntryID, err = dm.Cron.AddFunc(dm.AutoBackupTime, func() {
 			errBackup := dm.BackupAuto()
 			if errBackup != nil {
-				log.Errorf("自动备份失败: %v", errBackup)
+				fmt.Println("自动备份失败: ", errBackup.Error())
 				return
 			}
 			if errBackup = dm.BackupClean(true); errBackup != nil {
-				log.Errorf("滚动清理备份失败: %v", errBackup)
+				fmt.Println("滚动清理备份失败: ", errBackup.Error())
 			}
 		})
 		if err != nil {
-			log.Errorf("设定的自动备份间隔有误: %v", err)
+			if len(dm.Dice) > 0 {
+				dm.Dice[0].Logger.Errorf("设定的自动备份间隔有误: %v", err.Error())
+			}
 			return
 		}
 	}
@@ -303,11 +305,14 @@ func (dm *DiceManager) ResetBackupClean() {
 		dm.backupCleanCronID, err = dm.Cron.AddFunc(dm.BackupCleanCron, func() {
 			errBackup := dm.BackupClean(false)
 			if errBackup != nil {
-				log.Errorf("定时清理备份失败: %v", errBackup)
+				fmt.Println("定时清理备份失败: ", errBackup.Error())
 			}
 		})
+
 		if err != nil {
-			log.Errorf("设定的备份清理cron有误: %q %v", dm.BackupCleanCron, err)
+			if len(dm.Dice) > 0 {
+				dm.Dice[0].Logger.Errorf("设定的备份清理cron有误: %q %v", dm.BackupCleanCron, err)
+			}
 			return
 		}
 	}
@@ -321,8 +326,8 @@ func (dm *DiceManager) TryCreateDefault() {
 	if len(dm.Dice) == 0 {
 		defaultDice := new(Dice)
 		defaultDice.BaseConfig.Name = "default"
-		defaultDice.Config.MessageDelayRangeStart = DefaultConfig.MessageDelayRangeStart
-		defaultDice.Config.MessageDelayRangeEnd = DefaultConfig.MessageDelayRangeEnd
+		defaultDice.MessageDelayRangeStart = 0.4
+		defaultDice.MessageDelayRangeEnd = 0.9
 		defaultDice.MarkModified()
 		defaultDice.ContainerMode = dm.ContainerMode
 		dm.Dice = append(dm.Dice, defaultDice)

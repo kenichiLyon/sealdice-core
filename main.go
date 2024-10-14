@@ -1,8 +1,6 @@
 package main
 
-// _ "net/http/pprof"
 import (
-	"errors"
 	"fmt"
 	"io/fs"
 	"mime"
@@ -17,35 +15,30 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gofrs/flock"
+	// _ "net/http/pprof"
+
 	"github.com/jessevdk/go-flags"
-	"github.com/joho/godotenv"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"go.uber.org/zap/zapcore"
 
 	"sealdice-core/api"
 	"sealdice-core/dice"
-	"sealdice-core/dice/service"
+	"sealdice-core/dice/model"
 	"sealdice-core/migrate"
 	"sealdice-core/static"
 	"sealdice-core/utils/crypto"
-	"sealdice-core/utils/dboperator"
 	log "sealdice-core/utils/kratos"
-	"sealdice-core/utils/oschecker"
-	"sealdice-core/utils/paniclog"
 )
 
-/*
-*
+/**
 二进制目录结构:
 data/configs
 data/extensions
 data/logs
+
 extensions/
 */
-
-var sealLock = flock.New("sealdice-lock.lock")
 
 func cleanupCreate(diceManager *dice.DiceManager) func() {
 	return func() {
@@ -59,10 +52,6 @@ func cleanupCreate(diceManager *dice.DiceManager) func() {
 				exec.Command("pause") // windows专属
 			}
 		}
-		err = sealLock.Unlock()
-		if err != nil {
-			log.Errorf("文件锁归还出现异常 %v", err)
-		}
 
 		if !diceManager.CleanupFlag.CompareAndSwap(0, 1) {
 			// 尝试更新cleanup标记，如果已经为1则退出
@@ -71,9 +60,8 @@ func cleanupCreate(diceManager *dice.DiceManager) func() {
 
 		for _, i := range diceManager.Dice {
 			if i.IsAlreadyLoadConfig {
-				i.Config.BanList.SaveChanged(i)
+				i.BanList.SaveChanged(i)
 				i.Save(true)
-				i.AttrsManager.Stop()
 				for _, j := range i.ExtList {
 					if j.Storage != nil {
 						// 关闭
@@ -94,7 +82,39 @@ func cleanupCreate(diceManager *dice.DiceManager) func() {
 
 		for _, i := range diceManager.Dice {
 			d := i
-			d.DBOperator.Close()
+			(func() {
+				defer func() {
+					_ = recover()
+				}()
+				dbData := d.DBData
+				if dbData != nil {
+					d.DBData = nil
+					_ = dbData.Close()
+				}
+			})()
+
+			(func() {
+				defer func() {
+					_ = recover()
+				}()
+				dbLogs := d.DBLogs
+				if dbLogs != nil {
+					d.DBLogs = nil
+					_ = dbLogs.Close()
+				}
+			})()
+
+			(func() {
+				defer func() {
+					_ = recover()
+				}()
+				cm := d.CensorManager
+				if cm != nil && cm.DB != nil {
+					dbCensor := cm.DB
+					cm.DB = nil
+					_ = dbCensor.Close()
+				}
+			})()
 		}
 
 		// 清理gocqhttp
@@ -171,55 +191,27 @@ func main() {
 		LogLevel               int8   `long:"log-level" description:"设置日志等级" default:"0" choice:"-1" choice:"0" choice:"1" choice:"2" choice:"3" choice:"4" choice:"5"`
 		ContainerMode          bool   `long:"container-mode" description:"容器模式，该模式下禁用内置客户端"`
 	}
-	// 读取命令行传参
+
 	_, err := flags.ParseArgs(&opts, os.Args)
 	if err != nil {
 		return
 	}
-	// 提前到最开始初始化所有日志
-	// 1. 初始化全局Kartos日志
-	log.InitZapWithKartosLog(zapcore.Level(opts.LogLevel))
-	// 2. 初始化全局panic捕获日志
-	paniclog.InitPanicLog()
-	// 3. 提示日志打印
-	log.Info("运行日志开始记录，海豹出现故障时可查看 data/main.log 与 data/panic.log 获取更多信息")
-	// 加载env相关
-	err = godotenv.Load()
-	if err != nil {
-		log.Errorf("未读取到.env参数，若您未使用docker或第三方数据库，可安全忽略。")
-	}
-	// 初始化文件加锁系统
-	locked, err := sealLock.TryLock()
-	// 如果有错误，或者未能取到锁
-	if err != nil || !locked {
-		// 打日志的时候防止打出nil
-		if err == nil {
-			err = errors.New("海豹正在运行中")
-		}
-		log.Errorf("获取锁文件失败，原因为: %v", err)
-		showMsgBox("获取锁文件失败", "为避免数据损坏，拒绝继续启动。请检查是否启动多份海豹程序！")
-		return
-	}
-	judge, osr := oschecker.OldVersionCheck()
-	// 预留收集信息的接口，如果有需要可以考虑从这里拿数据。不从这里做提示的原因是Windows和Linux的展示方式不同。
-	if judge {
-		log.Info(osr)
-	}
+
 	if opts.Version {
-		fmt.Fprintln(os.Stdout, dice.VERSION.String())
+		fmt.Println(dice.VERSION.String())
 		return
 	}
 	if opts.DBCheck {
-		dboperator.DBCheck()
+		model.DBCheck("data/default")
 		return
 	}
 	if opts.VacuumDB {
-		service.DBVacuum()
+		model.DBVacuum()
 		return
 	}
 	if opts.ShowEnv {
 		for i, e := range os.Environ() {
-			fmt.Fprintln(os.Stdout, i, e)
+			println(i, e)
 		}
 		return
 	}
@@ -236,17 +228,11 @@ func main() {
 
 	_ = os.MkdirAll("./data", 0o755)
 
-	// 提早初始化是为了读取ServiceName
+	// 初始化全局Kartos日志，由于DICE部分已经完全被砍掉了，所以原本的日志等级用来设置控制台展示的日志等级或许更合适
+	log.InitZapWithKartosLog(zapcore.Level(opts.LogLevel))
 
-	// diceManager初始化数据库
-	operator, err := dboperator.GetDatabaseOperator()
-	if err != nil {
-		log.Errorf("Failed to init database: %v", err)
-		return
-	}
-	diceManager := &dice.DiceManager{
-		Operator: operator,
-	}
+	// 提早初始化是为了读取ServiceName
+	diceManager := &dice.DiceManager{}
 
 	if opts.ContainerMode {
 		log.Info("当前为容器模式，内置适配器与更新功能已被禁用")
@@ -297,7 +283,7 @@ func main() {
 			log.Warn("检测到 auto_update.exe，即将自动退出当前程序并进行升级")
 			log.Warn("程序目录下会出现“升级日志.log”，这代表升级正在进行中，如果失败了请检查此文件。")
 
-			err = CheckUpdater(diceManager)
+			err := CheckUpdater(diceManager)
 			if err != nil {
 				log.Error("升级程序检查失败: ", err.Error())
 			} else {
@@ -319,7 +305,7 @@ func main() {
 		}
 
 		if doNext {
-			err = CheckUpdater(diceManager)
+			err := CheckUpdater(diceManager)
 			if err != nil {
 				log.Error("升级程序检查失败: ", err.Error())
 			} else {
@@ -334,7 +320,7 @@ func main() {
 	removeUpdateFiles()
 
 	if opts.UpdateTest {
-		err = CheckUpdater(diceManager)
+		err := CheckUpdater(diceManager)
 		if err != nil {
 			log.Error("升级程序检查失败: ", err.Error())
 		} else {
@@ -344,7 +330,7 @@ func main() {
 
 	// 先临时放这里，后面再整理一下升级模块
 	diceManager.UpdateSealdiceByFile = func(packName string, log *log.Helper) bool {
-		err = CheckUpdater(diceManager)
+		err := CheckUpdater(diceManager)
 		if err != nil {
 			log.Error("升级程序检查失败: ", err.Error())
 			return false
@@ -365,8 +351,7 @@ func main() {
 
 	useBuiltinUI := false
 	checkFrontendExists := func() bool {
-		var stat os.FileInfo
-		stat, err = os.Stat("./frontend_overwrite")
+		stat, err := os.Stat("./frontend_overwrite")
 		return err == nil && stat.IsDir()
 	}
 	if !checkFrontendExists() {
@@ -377,11 +362,11 @@ func main() {
 	}
 
 	// 删除遗留的shm和wal文件
-	//  if !model.DBCacheDelete() {
-	//	  log.Error("数据库缓存文件删除失败")
-	//	  showMsgBox("数据库缓存文件删除失败", "为避免数据损坏，拒绝继续启动。请检查是否启动多份程序，或有其他程序正在使用数据库文件！")
-	//	  return
-	//  }
+	if !model.DBCacheDelete() {
+		log.Error("数据库缓存文件删除失败")
+		showMsgBox("数据库缓存文件删除失败", "为避免数据损坏，拒绝继续启动。请检查是否启动多份程序，或有其他程序正在使用数据库文件！")
+		return
+	}
 
 	// 尝试进行升级
 	migrate.TryMigrateToV12()
@@ -405,11 +390,8 @@ func main() {
 		log.Fatalf("移除旧帮助文档时出错，%v", migrateErr)
 	}
 	// v150升级
-	err = migrate.V150Upgrade()
-	if err != nil {
-		// Fatalf将会退出程序...或许应该用Errorf一类的吗？
-		log.Fatalf("您的146数据库可能存在问题，为保护数据，已经停止执行150升级命令。请尝试联系开发者，并提供你的日志。\n"+
-			"数据已回滚，您可暂时使用旧版本等待进一步的修复和更新。您的报错内容为: %v", err)
+	if !migrate.V150Upgrade() {
+		return
 	}
 
 	if !opts.ShowConsole || opts.MultiInstanceOnWindows {
@@ -470,7 +452,7 @@ func main() {
 	// err = nil
 	// err = http.ListenAndServe(":9090", nil)
 	// if err != nil {
-	// 	fmt.Fprintf(os.Stdout, "ListenAndServe: %s", err)
+	// 	fmt.Printf("ListenAndServe: %s", err)
 	// }
 
 	// darwin 的托盘菜单似乎需要在主线程启动才能工作，调整到这里
@@ -518,7 +500,7 @@ func diceServe(d *dice.Dice) {
 					}
 					if conn.EndPointInfoBase.ProtocolType == "onebot" {
 						pa := conn.Adapter.(*dice.PlatformAdapterGocq)
-						if pa.BuiltinMode == "lagrange" || pa.BuiltinMode == "lagrange-gocq" {
+						if pa.BuiltinMode == "lagrange" {
 							dice.LagrangeServe(d, conn, dice.LagrangeLoginInfo{
 								IsAsyncRun: true,
 							})
