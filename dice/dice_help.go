@@ -2,6 +2,7 @@ package dice
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	log "sealdice-core/utils/kratos"
 
 	"gopkg.in/yaml.v3"
 
@@ -220,7 +223,7 @@ func (m *HelpManager) Load() {
 	m.HelpDocTree = make([]*HelpDoc, 0)
 	entries, err := os.ReadDir("data/helpdoc")
 	if err != nil {
-		fmt.Println("unable to read helpdoc folder: ", err.Error())
+		log.Errorf("unable to read helpdoc folder: %v", err)
 	}
 	for _, entry := range entries {
 		if strings.HasPrefix(entry.Name(), ".") {
@@ -327,7 +330,7 @@ func (m *HelpManager) loadHelpDoc(group string, path string) bool {
 		m.LoadingFn = path
 		f, err := excelize.OpenFile(path)
 		if err != nil {
-			fmt.Println(err)
+			log.Error("HelpManager.loadHelpDoc", err)
 			break
 		}
 
@@ -342,7 +345,7 @@ func (m *HelpManager) loadHelpDoc(group string, path string) bool {
 							// 跳过第一行
 							continue
 						} else {
-							fmt.Printf("%s sheet %d(zero-based): %s\n", path, index, err)
+							log.Errorf("%s sheet %d(zero-based): %s\n", path, index, err)
 							break
 						}
 					}
@@ -350,7 +353,7 @@ func (m *HelpManager) loadHelpDoc(group string, path string) bool {
 						continue
 					}
 					key := row[0]
-					for j := 0; j < synonymCount; j++ {
+					for j := range synonymCount {
 						if len(row[1+j]) > 0 {
 							key += "/" + row[1+j]
 						}
@@ -370,7 +373,7 @@ func (m *HelpManager) loadHelpDoc(group string, path string) bool {
 
 		// Close the spreadsheet.
 		if err := f.Close(); err != nil {
-			fmt.Println(err)
+			log.Error("HelpManager.loadHelpDoc", err)
 		}
 		return true
 	}
@@ -380,7 +383,7 @@ func (m *HelpManager) loadHelpDoc(group string, path string) bool {
 // validateXlsxHeaders 验证 xlsx 格式 helpdoc 的表头是否是 Key Synonym（可能有多列） Content Description Catalogue Tag
 func validateXlsxHeaders(headers []string) (int, error) {
 	if len(headers) < 3 {
-		return 0, fmt.Errorf("helpdoc格式错误，缺少必须列 Key Synonym Content")
+		return 0, errors.New("helpdoc格式错误，缺少必须列 Key Synonym Content")
 	}
 
 	var (
@@ -564,7 +567,7 @@ func (m *HelpManager) searchBleve(ctx *MsgContext, text string, titleOnly bool, 
 func (m *HelpManager) Search(ctx *MsgContext, text string, titleOnly bool, pageSize, pageNum int, group string) (res *bleve.SearchResult, total, pageStart, pageEnd int, err error) {
 	if pageSize <= 0 || pageNum <= 0 {
 		// 为了使Search的结果完全忠实于分页参数, 而不产生有结果但与分页不相符的情况
-		return nil, 0, 0, 0, fmt.Errorf("分页参数错误")
+		return nil, 0, 0, 0, errors.New("分页参数错误")
 	}
 
 	if m.EngineType == 0 {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"mime"
@@ -17,6 +18,7 @@ import (
 
 	// _ "net/http/pprof"
 
+	"github.com/gofrs/flock"
 	"github.com/jessevdk/go-flags"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
@@ -29,16 +31,20 @@ import (
 	"sealdice-core/static"
 	"sealdice-core/utils/crypto"
 	log "sealdice-core/utils/kratos"
+	"sealdice-core/utils/oschecker"
+	"sealdice-core/utils/paniclog"
 )
 
-/**
+/*
+*
 二进制目录结构:
 data/configs
 data/extensions
 data/logs
-
 extensions/
 */
+
+var sealLock = flock.New("sealdice-lock.lock")
 
 func cleanupCreate(diceManager *dice.DiceManager) func() {
 	return func() {
@@ -52,6 +58,10 @@ func cleanupCreate(diceManager *dice.DiceManager) func() {
 				exec.Command("pause") // windows专属
 			}
 		}
+		err = sealLock.Unlock()
+		if err != nil {
+			log.Errorf("文件锁归还出现异常 %v", err)
+		}
 
 		if !diceManager.CleanupFlag.CompareAndSwap(0, 1) {
 			// 尝试更新cleanup标记，如果已经为1则退出
@@ -60,7 +70,7 @@ func cleanupCreate(diceManager *dice.DiceManager) func() {
 
 		for _, i := range diceManager.Dice {
 			if i.IsAlreadyLoadConfig {
-				i.BanList.SaveChanged(i)
+				i.Config.BanList.SaveChanged(i)
 				i.Save(true)
 				for _, j := range i.ExtList {
 					if j.Storage != nil {
@@ -89,7 +99,11 @@ func cleanupCreate(diceManager *dice.DiceManager) func() {
 				dbData := d.DBData
 				if dbData != nil {
 					d.DBData = nil
-					_ = dbData.Close()
+					db, err := dbData.DB()
+					if err != nil {
+						return
+					}
+					_ = db.Close()
 				}
 			})()
 
@@ -100,7 +114,11 @@ func cleanupCreate(diceManager *dice.DiceManager) func() {
 				dbLogs := d.DBLogs
 				if dbLogs != nil {
 					d.DBLogs = nil
-					_ = dbLogs.Close()
+					db, err := dbLogs.DB()
+					if err != nil {
+						return
+					}
+					_ = db.Close()
 				}
 			})()
 
@@ -112,7 +130,11 @@ func cleanupCreate(diceManager *dice.DiceManager) func() {
 				if cm != nil && cm.DB != nil {
 					dbCensor := cm.DB
 					cm.DB = nil
-					_ = dbCensor.Close()
+					db, err := dbCensor.DB()
+					if err != nil {
+						return
+					}
+					_ = db.Close()
 				}
 			})()
 		}
@@ -196,9 +218,33 @@ func main() {
 	if err != nil {
 		return
 	}
+	// 提前到最开始初始化所有日志
+	// 1. 初始化全局Kartos日志
+	log.InitZapWithKartosLog(zapcore.Level(opts.LogLevel))
+	// 2. 初始化全局panic捕获日志
+	paniclog.InitPanicLog()
+	// 3. 提示日志打印
+	log.Info("运行日志开始记录，海豹出现故障时可查看 data/main.log 与 data/panic.log 获取更多信息")
+	// 初始化文件加锁系统
 
+	locked, err := sealLock.TryLock()
+	// 如果有错误，或者未能取到锁
+	if err != nil || !locked {
+		// 打日志的时候防止打出nil
+		if err == nil {
+			err = errors.New("海豹正在运行中")
+		}
+		log.Errorf("获取锁文件失败，原因为: %v", err)
+		showMsgBox("获取锁文件失败", "为避免数据损坏，拒绝继续启动。请检查是否启动多份海豹程序！")
+		return
+	}
+	judge, osr := oschecker.OldVersionCheck()
+	// 预留收集信息的接口，如果有需要可以考虑从这里拿数据。不从这里做提示的原因是Windows和Linux的展示方式不同。
+	if judge {
+		log.Info(osr)
+	}
 	if opts.Version {
-		fmt.Println(dice.VERSION.String())
+		fmt.Fprintln(os.Stdout, dice.VERSION.String())
 		return
 	}
 	if opts.DBCheck {
@@ -211,7 +257,7 @@ func main() {
 	}
 	if opts.ShowEnv {
 		for i, e := range os.Environ() {
-			println(i, e)
+			fmt.Fprintln(os.Stdout, i, e)
 		}
 		return
 	}
@@ -227,9 +273,6 @@ func main() {
 	}
 
 	_ = os.MkdirAll("./data", 0o755)
-
-	// 初始化全局Kartos日志，由于DICE部分已经完全被砍掉了，所以原本的日志等级用来设置控制台展示的日志等级或许更合适
-	log.InitZapWithKartosLog(zapcore.Level(opts.LogLevel))
 
 	// 提早初始化是为了读取ServiceName
 	diceManager := &dice.DiceManager{}
@@ -362,11 +405,11 @@ func main() {
 	}
 
 	// 删除遗留的shm和wal文件
-	if !model.DBCacheDelete() {
-		log.Error("数据库缓存文件删除失败")
-		showMsgBox("数据库缓存文件删除失败", "为避免数据损坏，拒绝继续启动。请检查是否启动多份程序，或有其他程序正在使用数据库文件！")
-		return
-	}
+	//  if !model.DBCacheDelete() {
+	//	  log.Error("数据库缓存文件删除失败")
+	//	  showMsgBox("数据库缓存文件删除失败", "为避免数据损坏，拒绝继续启动。请检查是否启动多份程序，或有其他程序正在使用数据库文件！")
+	//	  return
+	//  }
 
 	// 尝试进行升级
 	migrate.TryMigrateToV12()
@@ -452,7 +495,7 @@ func main() {
 	// err = nil
 	// err = http.ListenAndServe(":9090", nil)
 	// if err != nil {
-	// 	fmt.Printf("ListenAndServe: %s", err)
+	// 	fmt.Fprintf(os.Stdout, "ListenAndServe: %s", err)
 	// }
 
 	// darwin 的托盘菜单似乎需要在主线程启动才能工作，调整到这里

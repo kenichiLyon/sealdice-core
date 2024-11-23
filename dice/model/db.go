@@ -2,17 +2,22 @@ package model
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 
-	"github.com/jmoiron/sqlx"
+	"gorm.io/gorm"
+
+	log "sealdice-core/utils/kratos"
 )
 
 func DBCheck(dataDir string) {
-	checkDB := func(db *sqlx.DB) bool {
-		rows, err := db.Query("PRAGMA integrity_check") //nolint:execinquery
+	checkDB := func(db *gorm.DB) bool {
+		rows, err := db.Exec("PRAGMA integrity_check").Rows()
 		if err != nil {
 			return false
 		}
+		defer rows.Close()
 		var ok bool
 		for rows.Next() {
 			var s string
@@ -20,7 +25,7 @@ func DBCheck(dataDir string) {
 				ok = false
 				break
 			}
-			fmt.Println(s)
+			fmt.Fprintln(os.Stdout, s)
 			if s == "ok" {
 				ok = true
 			}
@@ -33,226 +38,243 @@ func DBCheck(dataDir string) {
 	}
 
 	var ok1, ok2, ok3 bool
-	var dataDB *sqlx.DB
-	var logsDB *sqlx.DB
-	var censorDB *sqlx.DB
+	var dataDB *gorm.DB
+	var logsDB *gorm.DB
+	var censorDB *gorm.DB
 	var err error
 
 	dbDataPath, _ := filepath.Abs(filepath.Join(dataDir, "data.db"))
 	dataDB, err = _SQLiteDBInit(dbDataPath, false)
 	if err != nil {
-		fmt.Println("数据库 data.db 无法打开")
+		fmt.Fprintln(os.Stdout, "数据库 data.db 无法打开")
 	} else {
 		ok1 = checkDB(dataDB)
-		dataDB.Close()
+		db, _ := dataDB.DB()
+		// 关闭
+		db.Close()
 	}
 
 	dbDataLogsPath, _ := filepath.Abs(filepath.Join(dataDir, "data-logs.db"))
 	logsDB, err = _SQLiteDBInit(dbDataLogsPath, false)
 	if err != nil {
-		fmt.Println("数据库 data-logs.db 无法打开")
+		fmt.Fprintln(os.Stdout, "数据库 data-logs.db 无法打开")
 	} else {
 		ok2 = checkDB(logsDB)
-		logsDB.Close()
+		db, _ := logsDB.DB()
+		// 关闭db
+		db.Close()
 	}
 
 	dbDataCensorPath, _ := filepath.Abs(filepath.Join(dataDir, "data-censor.db"))
 	censorDB, err = _SQLiteDBInit(dbDataCensorPath, false)
 	if err != nil {
-		fmt.Println("数据库 data-censor.db 无法打开")
+		fmt.Fprintln(os.Stdout, "数据库 data-censor.db 无法打开")
 	} else {
 		ok3 = checkDB(censorDB)
-		censorDB.Close()
+		db, _ := censorDB.DB()
+		// 关闭db
+		db.Close()
 	}
 
-	fmt.Println("数据库检查结果：")
-	fmt.Println("data.db:", ok1)
-	fmt.Println("data-logs.db:", ok2)
-	fmt.Println("data-censor.db:", ok3)
+	fmt.Fprintln(os.Stdout, "数据库检查结果：")
+	fmt.Fprintln(os.Stdout, "data.db:", ok1)
+	fmt.Fprintln(os.Stdout, "data-logs.db:", ok2)
+	fmt.Fprintln(os.Stdout, "data-censor.db:", ok3)
 }
 
-func SQLiteDBInit(dataDir string) (dataDB *sqlx.DB, logsDB *sqlx.DB, err error) {
+var createSql = `
+CREATE TABLE attrs__temp (
+    id TEXT PRIMARY KEY,
+    data BYTEA,
+    attrs_type TEXT,
+    binding_sheet_id TEXT default '',
+    name TEXT default '',
+    owner_id TEXT default '',
+    sheet_type TEXT default '',
+    is_hidden BOOLEAN default FALSE,
+    created_at INTEGER default 0,
+    updated_at INTEGER default 0
+);
+`
+
+func SQLiteDBInit(dataDir string) (dataDB *gorm.DB, logsDB *gorm.DB, err error) {
 	dbDataPath, _ := filepath.Abs(filepath.Join(dataDir, "data.db"))
 	dataDB, err = _SQLiteDBInit(dbDataPath, true)
 	if err != nil {
-		return
+		return nil, nil, err
 	}
+	// 特殊情况建表语句处置
+	if strings.Contains(dataDB.Dialector.Name(), "sqlite") {
+		tx := dataDB.Begin()
+		// 检查是否有这个影响的注释
+		var count int64
+		err = dataDB.Raw("SELECT count(*) FROM `sqlite_master` WHERE tbl_name = 'attrs' AND `sql` LIKE '%这个方法太严格了%'").Count(&count).Error
+		if err != nil {
+			tx.Rollback()
+			return nil, nil, err
+		}
+		if count > 0 {
+			log.Warn("数据库 attrs 表结构为前置测试版本150,重建中")
+			// 创建临时表
+			err = tx.Exec(createSql).Error
+			if err != nil {
+				tx.Rollback()
+				return nil, nil, err
+			}
+			// 迁移数据
+			err = tx.Exec("INSERT INTO `attrs__temp` SELECT * FROM `attrs`").Error
+			if err != nil {
+				tx.Rollback()
+				return nil, nil, err
+			}
+			// 删除旧的表
+			err = tx.Exec("DROP TABLE `attrs`").Error
+			if err != nil {
+				tx.Rollback()
+				return nil, nil, err
+			}
+			// 改名
+			err = tx.Exec("ALTER TABLE `attrs__temp` RENAME TO `attrs`").Error
+			if err != nil {
+				tx.Rollback()
+				return nil, nil, err
+			}
+			tx.Commit()
+		}
+	}
+	// data建表
+	err = dataDB.AutoMigrate(
+		&GroupPlayerInfoBase{},
+		&GroupInfo{},
+		&BanInfo{},
+		&EndpointInfo{},
+		&AttributesItemModel{},
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	logsDB, err = LogDBInit(dataDir)
+	return
+}
 
+// LogDBInit SQLITE初始化
+func LogDBInit(dataDir string) (logsDB *gorm.DB, err error) {
 	dbDataLogsPath, _ := filepath.Abs(filepath.Join(dataDir, "data-logs.db"))
 	logsDB, err = _SQLiteDBInit(dbDataLogsPath, true)
 	if err != nil {
 		return
 	}
-
-	// data建表
-	texts := []string{
-		`
-create table if not exists group_player_info
-(
-    id                     INTEGER
-        primary key autoincrement,
-    group_id               TEXT,
-    user_id                TEXT,
-    name                   TEXT,
-    created_at             INTEGER,
-    updated_at             INTEGER,
-    last_command_time      INTEGER,
-    auto_set_name_template TEXT,
-    dice_side_num          TEXT
-);`,
-		`create index if not exists idx_group_player_info_group_id on group_player_info (group_id);`,
-		`create index if not exists idx_group_player_info_user_id on group_player_info (user_id);`,
-		`create unique index if not exists idx_group_player_info_group_user on group_player_info (group_id, user_id);`,
-		`
-create table if not exists group_info
-(
-    id         TEXT primary key,
-    created_at INTEGER,
-    updated_at INTEGER,
-    data       BLOB
-);`,
-
-		`
-create table if not exists ban_info
-(
-    id         TEXT primary key,
-    ban_updated_at INTEGER,
-    updated_at INTEGER,
-    data       BLOB
-);`,
-		`create index if not exists idx_ban_info_updated_at on ban_info (updated_at);`,
-		`create index if not exists idx_ban_info_ban_updated_at on ban_info (ban_updated_at);`,
-
-		`CREATE TABLE IF NOT EXISTS endpoint_info (
-user_id TEXT PRIMARY KEY,
-cmd_num INTEGER,
-cmd_last_time INTEGER,
-online_time INTEGER,
-updated_at INTEGER
-);`,
-
-		`
-CREATE TABLE IF NOT EXISTS attrs (
-    id TEXT PRIMARY KEY,
-    data BYTEA,
-    attrs_type TEXT,
-
-	-- 坏，Get这个方法太严格了，所有的字段都要有默认值，不然无法反序列化
-	binding_sheet_id TEXT default '',
-
-    name TEXT default '',
-    owner_id TEXT default '',
-    sheet_type TEXT default '',
-    is_hidden BOOLEAN default FALSE,
-
-    created_at INTEGER default 0,
-    updated_at INTEGER  default 0
-);
-`,
-		`create index if not exists idx_attrs_binding_sheet_id on attrs (binding_sheet_id);`,
-		`create index if not exists idx_attrs_owner_id_id on attrs (owner_id);`,
-		`create index if not exists idx_attrs_attrs_type_id on attrs (attrs_type);`,
-	}
-	for _, i := range texts {
-		_, _ = dataDB.Exec(i)
-	}
-
 	// logs建表
-	texts = []string{
-		`
-create table if not exists logs
-(
-    id         INTEGER  primary key autoincrement,
-    name       TEXT,
-    group_id   TEXT,
-    extra      TEXT,
-    created_at INTEGER,
-    updated_at INTEGER,
-    upload_url TEXT,
-    upload_time INTEGER
-);`,
-		`
-create index if not exists idx_logs_group
-    on logs (group_id);`,
-		`
-create index if not exists idx_logs_update_at
-    on logs (updated_at);`,
-		`
-create unique index if not exists idx_log_group_id_name
-    on logs (group_id, name);`,
-		// 如果log_items有更改，需同步检查migrate/convert_logs.go
-		`
-create table if not exists log_items
-(
-    id              INTEGER primary key autoincrement,
-    log_id          INTEGER,
-    group_id        TEXT,
-    nickname        TEXT,
-    im_userid       TEXT,
-    time            INTEGER,
-    message         TEXT,
-    is_dice         INTEGER,
-    command_id      INTEGER,
-    command_info    TEXT,
-    raw_msg_id      TEXT,
-    user_uniform_id TEXT,
-    removed         INTEGER,
-    parent_id       INTEGER
-);`,
-		`
-create index if not exists idx_log_items_group_id
-    on log_items (log_id);`,
-		`
-create index if not exists idx_log_items_log_id
-    on log_items (log_id);`,
-
-		`alter table logs add upload_url text;`, // 测试版特供
-		`alter table logs add upload_time integer;`,
+	if err = logsDB.AutoMigrate(&LogInfo{}); err != nil {
+		return nil, err
 	}
 
-	for _, i := range texts {
-		_, _ = logsDB.Exec(i)
+	itemsAutoMigrate := false
+	dialect := logsDB.Dialector.Name()
+	if dialect != "sqlite" {
+		itemsAutoMigrate = true
+	} else {
+		if logsDB.Migrator().HasTable(&LogOneItem{}) {
+			if err = logItemsSQLiteMigrate(logsDB); err != nil {
+				return nil, err
+			}
+		} else {
+			itemsAutoMigrate = true
+		}
 	}
 
-	return
+	if itemsAutoMigrate {
+		if err = logsDB.AutoMigrate(&LogOneItem{}); err != nil {
+			return nil, err
+		}
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	return logsDB, nil
 }
 
-func SQLiteCensorDBInit(dataDir string) (censorDB *sqlx.DB, err error) {
+func logItemsSQLiteMigrate(db *gorm.DB) error {
+	type DBColumn struct {
+		Name string
+		Type string
+	}
+
+	// 获取当前列信息
+	var currentColumns []DBColumn
+	err := db.Raw("PRAGMA table_info(log_items)").Scan(&currentColumns).Error
+	if err != nil {
+		return err
+	}
+
+	// 获取模型定义的列信息
+	var modelColumns []DBColumn
+	stmt := &gorm.Statement{DB: db}
+	err = stmt.Parse(&LogOneItem{})
+	if err != nil {
+		return err
+	}
+	for _, field := range stmt.Schema.Fields {
+		if field.DBName != "" {
+			x := db.Migrator().FullDataTypeOf(field)
+			col := strings.SplitN(x.SQL, " ", 2)[0]
+			modelColumns = append(modelColumns, DBColumn{field.DBName, strings.ToLower(col)})
+		}
+	}
+
+	// 比较列是否有变化
+	needMigrate := false
+	if len(currentColumns) != len(modelColumns) {
+		needMigrate = true
+	} else {
+		columnMap := make(map[string]string)
+		for _, col := range currentColumns {
+			columnMap[col.Name] = strings.ToLower(col.Type)
+		}
+
+		for _, col := range modelColumns {
+			newType := col.Type
+			currentType := columnMap[col.Name]
+
+			// 特殊处理 is_dice 列,允许 bool 或 numeric 类型
+			if col.Name == "is_dice" {
+				if currentType != "bool" && currentType != "numeric" {
+					needMigrate = true
+					break
+				}
+				continue
+			}
+
+			if currentType != newType {
+				needMigrate = true
+				break
+			}
+		}
+	}
+
+	// 如果需要迁移则执行
+	if needMigrate {
+		log.Info("现在进行log_items表的迁移，如果数据库较大，会花费较长时间，请耐心等待")
+		log.Info("若是迁移后观察到数据库体积显著膨胀，可以关闭骰子使用 sealdice-core --vacuum 进行数据库整理，这同样会花费较长时间")
+		return db.AutoMigrate()
+	}
+
+	return nil
+}
+
+func SQLiteCensorDBInit(dataDir string) (censorDB *gorm.DB, err error) {
 	path, err := filepath.Abs(filepath.Join(dataDir, "data-censor.db"))
 	if err != nil {
-		return
+		return nil, err
 	}
 	censorDB, err = _SQLiteDBInit(path, true)
 	if err != nil {
-		return
+		return nil, err
 	}
-
-	texts := []string{`
-CREATE TABLE IF NOT EXISTS censor_log
-(
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    msg_type 		TEXT,
-    user_id         TEXT,
-    group_id 		TEXT,
-    content         TEXT,
-    sensitive_words TEXT,
-    highest_level   INTEGER,
-    created_at 		INTEGER,
-    clear_mark		BOOLEAN
-);
-`,
-		`
-CREATE INDEX IF NOT EXISTS idx_censor_log_user_id
-    ON censor_log (user_id);
-`,
-		`
-CREATE INDEX IF NOT EXISTS idx_censor_log_level
-    ON censor_log (highest_level);
-`,
+	// 创建基本的表结构，并通过标签定义索引
+	if err = censorDB.AutoMigrate(&CensorLog{}); err != nil {
+		return nil, err
 	}
-
-	for _, i := range texts {
-		_, _ = censorDB.Exec(i)
-	}
-	return
+	return censorDB, nil
 }

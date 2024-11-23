@@ -139,6 +139,7 @@ func socketSendText(socket *gowebsocket.Socket, s string) {
 	}()
 
 	if socket != nil {
+		// 什么也不做，这样就能用来做不发话的测试
 		socket.SendText(s)
 	}
 }
@@ -159,8 +160,8 @@ func socketSendBinary(socket *gowebsocket.Socket, data []byte) { //nolint
 func doSleepQQ(ctx *MsgContext) {
 	if ctx.Dice != nil {
 		d := ctx.Dice
-		offset := d.MessageDelayRangeEnd - d.MessageDelayRangeStart
-		time.Sleep(time.Duration((d.MessageDelayRangeStart + rand.Float64()*offset) * float64(time.Second)))
+		offset := d.Config.MessageDelayRangeEnd - d.Config.MessageDelayRangeStart
+		time.Sleep(time.Duration((d.Config.MessageDelayRangeStart + rand.Float64()*offset) * float64(time.Second)))
 	} else {
 		time.Sleep(time.Duration((0.4 + rand.Float64()/2) * float64(time.Second)))
 	}

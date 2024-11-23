@@ -80,13 +80,19 @@ func DiceFormatV1(ctx *MsgContext, s string) (string, error) { //nolint:revive
 }
 
 func DiceFormat(ctx *MsgContext, s string) string {
-	ret, err := DiceFormatV2(ctx, s)
-	if err != nil {
-		// 遇到异常，尝试一下V1
-		ret, _ = DiceFormatV1(ctx, s)
+	engineVersion := ctx.Dice.getTargetVmEngineVersion(VmVersionMsg)
+	if engineVersion == "v2" {
+		ret, err := DiceFormatV2(ctx, s)
+		if err != nil {
+			// 遇到异常，尝试一下V1
+			ret, _ = DiceFormatV1(ctx, s)
+			return ret
+		}
+		return ret
+	} else {
+		ret, _ := DiceFormatV1(ctx, s)
 		return ret
 	}
-	return ret
 }
 
 func DiceFormatTmpl(ctx *MsgContext, s string) string {
@@ -98,7 +104,7 @@ func DiceFormatTmpl(ctx *MsgContext, s string) string {
 		text = ctx.Dice.TextMap[s].PickSource(randSourceDrawAndTmplSelect).(string)
 
 		// 找出其兼容情况，以决定使用什么版本的引擎
-		engineVersion := "v2"
+		engineVersion := ctx.Dice.getTargetVmEngineVersion(VMVersionCustomText)
 		if items, exists := ctx.Dice.TextMapCompatible.Load(s); exists {
 			if info, exists := items.Load(text); exists {
 				if info.Version == "v1" {
@@ -110,7 +116,7 @@ func DiceFormatTmpl(ctx *MsgContext, s string) string {
 		if engineVersion == "v2" {
 			ret, _ := DiceFormatV2(ctx, text)
 			return ret
-		} else if engineVersion == "v1" {
+		} else {
 			ret, _ := DiceFormatV1(ctx, text)
 			return ret
 		}
@@ -620,7 +626,7 @@ func (ctx *MsgContext) CreateVmIfNotExists() {
 			if size > 1 {
 				// 次级结果，如 (10d3)d5 中，此处为10d3的结果
 				// 例如 (10d3)d5=63[(10d3)d5=...,10d3=19]
-				for j := 0; j < len(item.spans)-1; j++ {
+				for j := range len(item.spans) - 1 {
 					span := item.spans[j]
 					subDetailsText += "," + string(detailResult[span.Begin:span.End]) + "=" + span.Ret.ToString()
 				}
@@ -678,7 +684,8 @@ func (ctx *MsgContext) CreateVmIfNotExists() {
 			detailArr = append(detailArr, d.V())
 		}
 
-		detailStr := string(detailResult)
+		// TODO: 此时加了TrimSpace表现正常，但深层原因是ds在处理"d3 x"这个表达式时多吃了一个空格，修复后取消trim
+		detailStr := strings.TrimSpace(string(detailResult))
 		if detailStr == ctx.Ret.ToString() {
 			detailStr = "" // 如果detail和结果值完全一致，那么将其置空
 		}
@@ -689,7 +696,7 @@ func (ctx *MsgContext) CreateVmIfNotExists() {
 	// 设置默认骰子面数
 	if ctx.Group != nil {
 		// 情况不明，在sealchat的第一次测试中出现Group为nil
-		ctx.vm.Config.DefaultDiceSideExpr = fmt.Sprintf("%d", ctx.Group.DiceSideNum)
+		ctx.vm.Config.DefaultDiceSideExpr = strconv.FormatInt(ctx.Group.DiceSideNum, 10)
 		if ctx.vm.Config.DefaultDiceSideExpr == "0" {
 			ctx.vm.Config.DefaultDiceSideExpr = "100"
 		}

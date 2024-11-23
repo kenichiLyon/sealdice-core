@@ -1,7 +1,6 @@
 package dice
 
 import (
-	"fmt"
 	"os"
 	"sync/atomic"
 	"time"
@@ -82,8 +81,8 @@ type DiceManager struct { //nolint:revive
 	CleanupFlag   atomic.Uint32 // 1 为正在清理，0为普通状态
 }
 
-type DiceConfigs struct { //nolint:revive
-	DiceConfigs       []DiceConfig `yaml:"diceConfigs"`
+type Configs struct { //nolint:revive
+	DiceConfigs       []BaseConfig `yaml:"diceConfigs"`
 	ServeAddress      string       `yaml:"serveAddress"`
 	WebUIAddress      string       `yaml:"webUIAddress"`
 	HelpDocEngineType int          `yaml:"helpDocEngineType"`
@@ -150,10 +149,10 @@ func (dm *DiceManager) LoadDice() {
 		return
 	}
 
-	var dc DiceConfigs
+	var dc Configs
 	err = yaml.Unmarshal(data, &dc)
 	if err != nil {
-		fmt.Println("读取 data/dice.yaml 发生错误: 配置文件格式不正确")
+		log.Error("读取 data/dice.yaml 发生错误: 配置文件格式不正确", err)
 		panic(err)
 	}
 
@@ -196,7 +195,7 @@ func (dm *DiceManager) LoadDice() {
 }
 
 func (dm *DiceManager) Save() {
-	var dc DiceConfigs
+	var dc Configs
 	dc.ServeAddress = dm.ServeAddress
 	dc.HelpDocEngineType = dm.HelpDocEngineType
 	dc.UIPasswordSalt = dm.UIPasswordSalt
@@ -237,7 +236,7 @@ func (dm *DiceManager) InitDice() {
 
 	g, err := NewProcessExitGroup()
 	if err != nil {
-		fmt.Println("进程组创建失败，若进程崩溃，gocqhttp进程可能需要手动结束。")
+		log.Warn("进程组创建失败，若进程崩溃，gocqhttp进程可能需要手动结束。")
 	} else {
 		dm.progressExitGroupWin = g
 	}
@@ -250,9 +249,9 @@ func (dm *DiceManager) InitDice() {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				fmt.Println("帮助文档加载失败。可能是由于退出程序过快，帮助文档还未加载完成所致", r)
+				log.Warn("帮助文档加载失败。可能是由于退出程序过快，帮助文档还未加载完成所致", r)
 				if dm.Help != nil {
-					fmt.Println("帮助文件加载失败:", dm.Help.LoadingFn)
+					log.Warn("帮助文件加载失败:", dm.Help.LoadingFn)
 				}
 			}
 		}()
@@ -278,17 +277,15 @@ func (dm *DiceManager) ResetAutoBackup() {
 		dm.backupEntryID, err = dm.Cron.AddFunc(dm.AutoBackupTime, func() {
 			errBackup := dm.BackupAuto()
 			if errBackup != nil {
-				fmt.Println("自动备份失败: ", errBackup.Error())
+				log.Errorf("自动备份失败: %v", errBackup)
 				return
 			}
 			if errBackup = dm.BackupClean(true); errBackup != nil {
-				fmt.Println("滚动清理备份失败: ", errBackup.Error())
+				log.Errorf("滚动清理备份失败: %v", errBackup)
 			}
 		})
 		if err != nil {
-			if len(dm.Dice) > 0 {
-				dm.Dice[0].Logger.Errorf("设定的自动备份间隔有误: %v", err.Error())
-			}
+			log.Errorf("设定的自动备份间隔有误: %v", err)
 			return
 		}
 	}
@@ -305,14 +302,11 @@ func (dm *DiceManager) ResetBackupClean() {
 		dm.backupCleanCronID, err = dm.Cron.AddFunc(dm.BackupCleanCron, func() {
 			errBackup := dm.BackupClean(false)
 			if errBackup != nil {
-				fmt.Println("定时清理备份失败: ", errBackup.Error())
+				log.Errorf("定时清理备份失败: %v", errBackup)
 			}
 		})
-
 		if err != nil {
-			if len(dm.Dice) > 0 {
-				dm.Dice[0].Logger.Errorf("设定的备份清理cron有误: %q %v", dm.BackupCleanCron, err)
-			}
+			log.Errorf("设定的备份清理cron有误: %q %v", dm.BackupCleanCron, err)
 			return
 		}
 	}
@@ -326,8 +320,8 @@ func (dm *DiceManager) TryCreateDefault() {
 	if len(dm.Dice) == 0 {
 		defaultDice := new(Dice)
 		defaultDice.BaseConfig.Name = "default"
-		defaultDice.MessageDelayRangeStart = 0.4
-		defaultDice.MessageDelayRangeEnd = 0.9
+		defaultDice.Config.MessageDelayRangeStart = DefaultConfig.MessageDelayRangeStart
+		defaultDice.Config.MessageDelayRangeEnd = DefaultConfig.MessageDelayRangeEnd
 		defaultDice.MarkModified()
 		defaultDice.ContainerMode = dm.ContainerMode
 		dm.Dice = append(dm.Dice, defaultDice)
