@@ -1,22 +1,30 @@
 package dice
 
 import (
-	"database/sql"
+	"context"
 	"errors"
 	"fmt"
 	"time"
 
-	"github.com/jmoiron/sqlx"
 	ds "github.com/sealdice/dicescript"
 
-	"sealdice-core/dice/model"
+	"sealdice-core/dice/service"
+	"sealdice-core/model"
+	"sealdice-core/utils/constant"
+	"sealdice-core/utils/dboperator/engine"
 	log "sealdice-core/utils/kratos"
 )
 
 type AttrsManager struct {
-	db     *sqlx.DB
+	db     engine.DatabaseOperator
 	logger *log.Helper
+	cancel context.CancelFunc
 	m      SyncMap[string, *AttributesItem]
+}
+
+func (am *AttrsManager) Stop() {
+	log.Info("结束数据库保存程序...")
+	am.cancel()
 }
 
 // LoadByCtx 获取当前角色，如有绑定，则获取绑定的角色，若无绑定，获取群内默认卡
@@ -39,7 +47,7 @@ func (am *AttrsManager) Load(groupId string, userId string) (*AttributesItem, er
 
 	//	1. 首先获取当前群+用户所绑定的卡
 	// 绑定卡的id是nanoid
-	id, err := model.AttrsGetBindingSheetIdByGroupId(am.db, gid)
+	id, err := service.AttrsGetBindingSheetIdByGroupId(am.db, gid)
 	if err != nil {
 		return nil, err
 	}
@@ -59,7 +67,7 @@ func (am *AttrsManager) UIDConvert(userId string) string {
 
 func (am *AttrsManager) GetCharacterList(userId string) ([]*model.AttributesItemModel, error) {
 	userId = am.UIDConvert(userId)
-	lst, err := model.AttrsGetCharacterListByUserId(am.db, userId)
+	lst, err := service.AttrsGetCharacterListByUserId(am.db, userId)
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +83,7 @@ func (am *AttrsManager) CharNew(userId string, name string, sheetType string) (*
 		return nil, err
 	}
 
-	return model.AttrsNewItem(am.db, &model.AttributesItemModel{
+	return service.AttrsNewItem(am.db, &model.AttributesItemModel{
 		Name:      name,
 		OwnerId:   userId,
 		AttrsType: "character",
@@ -85,7 +93,7 @@ func (am *AttrsManager) CharNew(userId string, name string, sheetType string) (*
 }
 
 func (am *AttrsManager) CharDelete(id string) error {
-	if err := model.AttrsDeleteById(am.db, id); err != nil {
+	if err := service.AttrsDeleteById(am.db, id); err != nil {
 		return err
 	}
 	// 从缓存中删除
@@ -107,7 +115,7 @@ func (am *AttrsManager) LoadById(id string) (*AttributesItem, error) {
 	}
 
 	// 2. 从新数据库加载
-	data, err := model.AttrsGetById(am.db, id)
+	data, err := service.AttrsGetById(am.db, id)
 	if err == nil {
 		if data.IsDataExists() {
 			var v *ds.VMValue
@@ -147,94 +155,135 @@ func (am *AttrsManager) LoadById(id string) (*AttributesItem, error) {
 }
 
 func (am *AttrsManager) Init(d *Dice) {
-	am.db = d.DBData
+	am.db = d.DBOperator
 	am.logger = d.Logger
+	// 创建一个 context 用于取消 goroutine
+	ctx, cancel := context.WithCancel(context.Background())
+	// 确保程序退出时取消上下文
 	go func() {
 		// NOTE(Xiangze Li): 这种不退出的goroutine不利于平稳结束程序
 		for {
-			am.CheckForSave()
-			am.CheckAndFreeUnused()
-			time.Sleep(15 * time.Second)
+			select {
+			case <-ctx.Done():
+				// 检测到取消信号后退出循环
+				return
+			default:
+				// 正常工作
+				err := am.CheckForSave()
+				if err != nil {
+					log.Errorf("数据库保存程序出错: %v", err)
+				}
+				err = am.CheckAndFreeUnused()
+				if err != nil {
+					log.Errorf("数据库保存-清理程序出错: %v", err)
+				}
+				time.Sleep(60 * time.Second)
+			}
 		}
 	}()
+	am.cancel = cancel
 }
 
-func (am *AttrsManager) CheckForSave() (int, int) {
-	times := 0
-	saved := 0
-
-	db := am.db
-	if db == nil {
+func (am *AttrsManager) CheckForSave() error {
+	if am.db == nil {
 		// 尚未初始化
-		return 0, 0
+		return errors.New("数据库尚未初始化")
 	}
-
-	tx, err := db.Begin()
-	if err != nil {
-		if am.logger != nil {
-			am.logger.Errorf("定期写入用户数据出错(创建事务): %v", err)
-		}
-		return 0, 0
-	}
-
+	var resultList []*service.AttributesBatchUpsertModel
+	prepareToSave := map[string]int{}
 	am.m.Range(func(key string, value *AttributesItem) bool {
 		if !value.IsSaved {
-			saved += 1
-			value.SaveToDB(db, tx)
+			saveModel, err := value.GetBatchSaveModel()
+			if err != nil {
+				// 打印日志
+				log.Errorf("定期写入用户数据出错(获取批量保存模型): %v", err)
+				return true
+			}
+			prepareToSave[key] = 1
+			resultList = append(resultList, saveModel)
 		}
-		times += 1
 		return true
 	})
-
-	err = tx.Commit()
-	if err != nil {
-		if am.logger != nil {
-			am.logger.Errorf("定期写入用户数据出错(提交事务): %v", err)
-		}
-		_ = tx.Rollback()
-		return times, 0
+	// 整体落盘
+	if len(resultList) == 0 {
+		return nil
 	}
-	return times, saved
+
+	if err := service.AttrsPutsByIDBatch(am.db, resultList); err != nil {
+		log.Errorf("定期写入用户数据出错(批量保存): %v", err)
+		return err
+	}
+	for key := range prepareToSave {
+		// 理应不存在这个数据没有的情况
+		v, _ := am.m.Load(key)
+		v.IsSaved = true
+	}
+	// 输出日志本次落盘了几个数据
+
+	return nil
 }
 
 // CheckAndFreeUnused 此函数会被定期调用，释放最近不用的对象
-func (am *AttrsManager) CheckAndFreeUnused() {
-	db := am.db
+func (am *AttrsManager) CheckAndFreeUnused() error {
+	db := am.db.GetDataDB(constant.WRITE)
 	if db == nil {
 		// 尚未初始化
-		return
+		return errors.New("数据库尚未初始化")
 	}
 
 	prepareToFree := map[string]int{}
-	currentTime := time.Now().Unix()
+	currentTime := time.Now()
+	var resultList []*service.AttributesBatchUpsertModel
 	am.m.Range(func(key string, value *AttributesItem) bool {
-		if value.LastUsedTime-currentTime > 60*10 {
+		lastUsedTime := time.Unix(value.LastUsedTime, 0)
+		if currentTime.Sub(lastUsedTime) > 10*time.Minute {
+			saveModel, err := value.GetBatchSaveModel()
+			if err != nil {
+				// 打印日志
+				log.Errorf("定期清理用户数据出错(获取批量保存模型): %v", err)
+				return true
+			}
 			prepareToFree[key] = 1
-			value.SaveToDB(am.db, nil)
+			resultList = append(resultList, saveModel)
 		}
 		return true
 	})
 
-	for key := range prepareToFree {
-		am.m.Delete(key)
+	// 整体落盘
+	if len(resultList) == 0 {
+		return nil
 	}
+
+	if err := service.AttrsPutsByIDBatch(am.db, resultList); err != nil {
+		log.Errorf("定期清理写入用户数据出错(批量保存): %v", err)
+		return err
+	}
+
+	for key := range prepareToFree {
+		// 理应不存在这个数据没有的情况
+		v, ok := am.m.LoadAndDelete(key)
+		if ok {
+			v.IsSaved = true
+		}
+	}
+	return nil
 }
 
 func (am *AttrsManager) CharBind(charId string, groupId string, userId string) error {
 	userId = am.UIDConvert(userId)
 	id := fmt.Sprintf("%s-%s", groupId, userId)
-	return model.AttrsBindCharacter(am.db, charId, id)
+	return service.AttrsBindCharacter(am.db, charId, id)
 }
 
 // CharGetBindingId 获取当前群绑定的角色ID
 func (am *AttrsManager) CharGetBindingId(groupId string, userId string) (string, error) {
 	userId = am.UIDConvert(userId)
 	id := fmt.Sprintf("%s-%s", groupId, userId)
-	return model.AttrsGetBindingSheetIdByGroupId(am.db, id)
+	return service.AttrsGetBindingSheetIdByGroupId(am.db, id)
 }
 
 func (am *AttrsManager) CharIdGetByName(userId string, name string) (string, error) {
-	return model.AttrsGetIdByUidAndName(am.db, userId, name)
+	return service.AttrsGetIdByUidAndName(am.db, userId, name)
 }
 
 func (am *AttrsManager) CharCheckExists(userId string, name string) bool {
@@ -243,7 +292,7 @@ func (am *AttrsManager) CharCheckExists(userId string, name string) bool {
 }
 
 func (am *AttrsManager) CharGetBindingGroupIdList(id string) []string {
-	all, err := model.AttrsCharGetBindingList(am.db, id)
+	all, err := service.AttrsCharGetBindingList(am.db, id)
 	if err != nil {
 		return []string{}
 	}
@@ -261,7 +310,7 @@ func (am *AttrsManager) CharGetBindingGroupIdList(id string) []string {
 
 func (am *AttrsManager) CharUnbindAll(id string) []string {
 	all := am.CharGetBindingGroupIdList(id)
-	_, err := model.AttrsCharUnbindAll(am.db, id)
+	_, err := service.AttrsCharUnbindAll(am.db, id)
 	if err != nil {
 		return []string{}
 	}
@@ -279,18 +328,31 @@ type AttributesItem struct {
 	SheetType        string
 }
 
-func (i *AttributesItem) SaveToDB(db *sqlx.DB, tx *sql.Tx) {
+func (i *AttributesItem) SaveToDB(db engine.DatabaseOperator) {
 	// 使用事务写入
 	rawData, err := ds.NewDictVal(i.valueMap).V().ToJSON()
 	if err != nil {
 		return
 	}
-	err = model.AttrsPutById(db, tx, i.ID, rawData, i.Name, i.SheetType)
+	err = service.AttrsPutById(db, i.ID, rawData, i.Name, i.SheetType)
 	if err != nil {
-		fmt.Println("保存数据失败", err.Error())
+		log.Error("保存数据失败", err.Error())
 		return
 	}
 	i.IsSaved = true
+}
+
+func (i *AttributesItem) GetBatchSaveModel() (*service.AttributesBatchUpsertModel, error) {
+	rawData, err := ds.NewDictVal(i.valueMap).V().ToJSON()
+	if err != nil {
+		return nil, err
+	}
+	return &service.AttributesBatchUpsertModel{
+		Id:        i.ID,
+		Data:      rawData,
+		Name:      i.Name,
+		SheetType: i.SheetType,
+	}, nil
 }
 
 func (i *AttributesItem) Load(name string) *ds.VMValue {
