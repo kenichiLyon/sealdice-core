@@ -552,6 +552,12 @@ func FormatOnebotDiceIDQQ(diceQQ string) string {
 }
 
 func FormatOnebotDiceIDQQGroup(diceQQ string) string {
+	if diceQQ == "" {
+		return ""
+	}
+	if strings.HasPrefix(diceQQ, "QQ-Group:") {
+		return diceQQ
+	}
 	return fmt.Sprintf("QQ-Group:%s", diceQQ)
 }
 
